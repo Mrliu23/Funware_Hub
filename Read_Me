@@ -1,0 +1,11 @@
+应用	触发时机	音效类型
+引力迷宫	撞墙 (高速时)	pop.mp3
+吃到星星	coin.mp3
+关卡胜利	win.mp3
+像素画板	绘制/取色/切换工具	tap.mp3
+油漆桶填充	water.mp3
+保存成功	save.mp3
+清空画布	trash.mp3
+命运转盘	转动过程	tick.mp3 (模拟机械齿轮声)
+得出结果	cheer.mp3
+添加/删除选项	tap.mp3 / trash.mp3

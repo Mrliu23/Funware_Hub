@@ -1,0 +1,6 @@
+apk文件生成步骤
+(base) PS E:\software\Antigravity_Pro\Andrio_Demo> 
+1、npm run build
+2、npx cap sync
+3、cd android
+4、.\gradlew assembleDebug
