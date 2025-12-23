@@ -122,3 +122,4 @@ android/app/build/
 android/local.properties
 *.iml
 .idea/
+android_backup_native/gradle/wrapper/gradle-8.14.3-all.zip
