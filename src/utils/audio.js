@@ -9,32 +9,26 @@ const activeSounds = new Set();
 /**
  * 播放一次性音效
  * @param {string} filename 
- * @returns {Audio} 返回音频对象实例
  */
 export const playSound = (filename) => {
     try {
-        const audio = new Audio(`/sounds/${filename}`);
-        audio.volume = 0.6; // 默认音量
+        const path = `/sounds/${filename}`;
+        const audio = new Audio(path);
+        audio.volume = 0.5;
 
-        // 注册到全局集合
         activeSounds.add(audio);
-
-        // 播放结束或出错时移除
         audio.onended = () => activeSounds.delete(audio);
         audio.onerror = () => activeSounds.delete(audio);
 
         const playPromise = audio.play();
-
         if (playPromise !== undefined) {
-            playPromise.catch(error => {
-                console.warn(`音频播放失败 (${filename}):`, error);
-                activeSounds.delete(audio);
+            playPromise.catch(() => {
+                console.warn(`音频播放失败: ${filename}`);
             });
         }
 
         return audio;
     } catch (err) {
-        console.error("音频系统错误:", err);
         return null;
     }
 };

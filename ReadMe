@@ -4,3 +4,15 @@ apk文件生成步骤
 2、npx cap sync
 3、cd android
 4、.\gradlew assembleDebug
+
+颜色：
+bg-blue-500
+bg-yellow-500
+bg-red-500
+bg-green-500
+bg-orange-400
+bg-purple-400
+
+将软件发布到网上： https://app.netlify.com/drop
+
+摩斯密码 . red  -purple   green：空格

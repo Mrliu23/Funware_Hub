@@ -77,7 +77,7 @@ const MosquitoHunter = ({ onClose }) => {
             onClick={handleTap}
         >
             {/* 顶部返回按钮 */}
-            <div className="absolute top-4 left-4 z-20">
+            <div className="absolute top-10 left-4 z-20">
                 <button onClick={(e) => { e.stopPropagation(); onClose(); }} className="p-2 bg-white/10 text-white rounded-full">
                     <ArrowLeft size={24} />
                 </button>

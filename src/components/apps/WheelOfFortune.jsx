@@ -170,7 +170,7 @@ const WheelOfFortune = ({ onClose }) => {
     return (
         <div className="h-full bg-gradient-to-b from-indigo-900 to-purple-900 flex flex-col">
             {/* 顶部工具栏 */}
-            <div className="flex items-center justify-between p-4">
+            <div className="flex items-center justify-between pt-10 pb-4 px-4">
                 <button onClick={onClose} className="p-2 bg-white/10 rounded-full">
                     <ArrowLeft size={24} className="text-white" />
                 </button>

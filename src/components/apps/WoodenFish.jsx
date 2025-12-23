@@ -90,14 +90,14 @@ const WoodenFish = ({ onClose }) => {
     return (
         <div className="h-full flex flex-col bg-stone-900 text-amber-50 relative overflow-hidden">
             {/* 返回按钮 */}
-            <div className="absolute top-4 left-4 z-10">
+            <div className="absolute top-10 left-4 z-10">
                 <button onClick={onClose} className="p-2 bg-stone-800 rounded-full shadow-sm text-white active:scale-90 transition-transform">
                     <ArrowLeft size={24} />
                 </button>
             </div>
 
             {/* 重置按钮 (右上角) */}
-            <div className="absolute top-4 right-4 z-10">
+            <div className="absolute top-10 right-4 z-10">
                 <button
                     onClick={handleResetClick}
                     className="p-2 bg-stone-800 rounded-full shadow-sm text-stone-400 hover:text-red-400 active:scale-90 transition-transform"

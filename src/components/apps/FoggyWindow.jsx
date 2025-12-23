@@ -181,7 +181,7 @@ const FoggyWindow = ({ onClose }) => {
     return (
         <div className="h-full bg-black relative overflow-hidden select-none" ref={containerRef}>
             {/* 顶部返回 */}
-            <div className="absolute top-4 left-4 z-20">
+            <div className="absolute top-10 left-4 z-20">
                 <button onClick={onClose} className="p-2 bg-black/50 text-white rounded-full shadow-sm">
                     <ArrowLeft size={24} />
                 </button>

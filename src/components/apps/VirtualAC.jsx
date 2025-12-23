@@ -43,7 +43,7 @@ const VirtualAC = ({ onClose }) => {
     return (
         <div className="h-full flex flex-col bg-white text-gray-800 relative">
             {/* Header / Back Button */}
-            <div className="absolute top-4 left-4 z-10">
+            <div className="absolute top-10 left-4 z-10">
                 <button onClick={onClose} className="p-2 bg-gray-100 rounded-full shadow-sm">
                     <ChevronDown className="rotate-90" size={24} />
                 </button>

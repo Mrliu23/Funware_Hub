@@ -33,7 +33,7 @@ const EmotionFlush = ({ onClose }) => {
     return (
         <div className="h-full bg-slate-100 flex flex-col relative overflow-hidden">
             {/* 顶部返回 */}
-            <div className="absolute top-4 left-4 z-20">
+            <div className="absolute top-10 left-4 z-20">
                 <button onClick={onClose} className="p-2 bg-white/80 rounded-full shadow-sm active:scale-95 transition-transform">
                     <ArrowLeft size={24} className="text-slate-600" />
                 </button>

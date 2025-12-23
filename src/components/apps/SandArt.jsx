@@ -432,14 +432,14 @@ const SandArt = ({ onClose }) => {
             {mode === 'DRAWING' && (
                 <>
                     {/* 顶部返回 (保存并退出) */}
-                    <div className="absolute top-4 left-4 z-20">
+                    <div className="absolute top-10 left-4 z-20">
                         <button onClick={handleExit} className="p-2 bg-white/10 rounded-full shadow-sm text-white backdrop-blur-md active:scale-95 transition-transform">
                             <ArrowLeft size={24} />
                         </button>
                     </div>
 
                     {/* 右上角工具栏 */}
-                    <div className="absolute top-4 right-4 z-20 flex gap-2">
+                    <div className="absolute top-10 right-4 z-20 flex gap-2">
                         {/* 切换画布 (保存并返回菜单) */}
                         <button
                             onClick={handleBackToMenu}

@@ -456,7 +456,7 @@ const GameLoop = ({ gameState, setGameState, onClose, onReincarnateRequest }) =>
                 </motion.div>
             ))}
 
-            <div className="relative z-20 top-4 left-4 right-4 flex justify-between items-center">
+            <div className="relative z-20 top-10 left-4 right-4 flex justify-between items-center">
                 <div className="flex gap-4 items-center">
                     <button onClick={onClose} className="p-2 bg-slate-800/50 rounded-full border border-slate-700 backdrop-blur-sm"><ArrowLeft size={20} /></button>
                     <div className="flex flex-col">

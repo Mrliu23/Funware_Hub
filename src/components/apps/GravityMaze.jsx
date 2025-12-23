@@ -362,7 +362,7 @@ const GravityMaze = ({ onClose }) => {
     return (
         <div className="h-full bg-gradient-to-b from-slate-900 to-slate-800 flex flex-col">
             {/* 顶部UI栏 */}
-            <div className="flex items-center justify-between p-4">
+            <div className="flex items-center justify-between pt-10 pb-4 px-4">
                 <button onClick={onClose} className="p-2 bg-white/10 rounded-full">
                     <ArrowLeft size={24} className="text-white" />
                 </button>

@@ -65,7 +65,7 @@ const BubbleWrap = ({ onClose }) => {
     return (
         <div className="h-full flex flex-col bg-orange-50 relative">
             {/* Header */}
-            <div className="h-16 flex items-center justify-between px-4 bg-white shadow-sm z-10">
+            <div className="pt-10 pb-4 h-auto flex items-center justify-between px-4 bg-white/80 backdrop-blur-md shadow-sm z-10">
                 <button onClick={onClose} className="p-2 bg-gray-100 rounded-full">
                     <ArrowLeft size={24} className="text-gray-600" />
                 </button>

@@ -193,7 +193,7 @@ const PixelCanvas = ({ onClose }) => {
             onPointerLeave={handlePointerUp}
         >
             {/* 顶部工具栏 */}
-            <div className="flex items-center justify-between p-3 bg-neutral-800">
+            <div className="flex items-center justify-between pt-10 pb-3 px-3 bg-neutral-800">
                 <button onClick={onClose} className="p-2 bg-white/10 rounded-lg">
                     <ArrowLeft size={20} className="text-white" />
                 </button>

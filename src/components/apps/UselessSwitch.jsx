@@ -177,7 +177,7 @@ const UselessSwitch = ({ onClose }) => {
             )}
 
             {/* 顶部返回 */}
-            <div className="absolute top-4 left-4 z-10">
+            <div className="absolute top-10 left-4 z-10">
                 <button onClick={onClose} className="p-2 bg-white/50 rounded-full shadow-sm">
                     <ArrowLeft size={24} />
                 </button>

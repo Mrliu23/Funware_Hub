@@ -140,7 +140,7 @@ const CyberIncense = ({ onClose }) => {
     return (
         <div className="h-full flex flex-col bg-stone-950 text-stone-100 relative overflow-hidden">
             {/* 顶部返回按钮 */}
-            <div className="absolute top-4 left-4 z-10 flex gap-4">
+            <div className="absolute top-10 left-4 z-10 flex gap-4">
                 <button onClick={onClose} className="p-2 bg-stone-800 rounded-full shadow-sm text-stone-400">
                     <ArrowLeft size={24} />
                 </button>

@@ -132,7 +132,7 @@ const MoodJournal = ({ onClose }) => {
     return (
         <div className="h-full bg-gradient-to-b from-slate-900 to-slate-800 flex flex-col">
             {/* 顶部栏 */}
-            <div className="flex items-center justify-between p-4">
+            <div className="flex items-center justify-between pt-10 pb-4 px-4">
                 <button onClick={onClose} className="p-2 bg-white/10 rounded-full">
                     <ArrowLeft size={24} className="text-white" />
                 </button>
@@ -176,9 +176,9 @@ const MoodJournal = ({ onClose }) => {
                                     key={i}
                                     onClick={() => item && !item.isFuture && setSelectedDate(item.date)}
                                     className={`aspect-square rounded-lg flex flex-col items-center justify-center cursor-pointer transition-all ${!item ? '' :
-                                            item.isFuture ? 'opacity-30 cursor-not-allowed' :
-                                                item.isToday ? 'bg-indigo-500/30 ring-2 ring-indigo-400' :
-                                                    item.entry ? 'bg-white/10' : 'bg-white/5 hover:bg-white/10'
+                                        item.isFuture ? 'opacity-30 cursor-not-allowed' :
+                                            item.isToday ? 'bg-indigo-500/30 ring-2 ring-indigo-400' :
+                                                item.entry ? 'bg-white/10' : 'bg-white/5 hover:bg-white/10'
                                         }`}
                                 >
                                     {item && (

@@ -63,7 +63,7 @@ const HandCrank = ({ onClose }) => {
     return (
         <div className="h-full bg-slate-900 text-green-500 flex flex-col relative overflow-hidden">
             {/* 顶部返回 */}
-            <div className="absolute top-4 left-4 z-20">
+            <div className="absolute top-10 left-4 z-20">
                 <button onClick={onClose} className="p-2 bg-slate-800 rounded-full shadow-sm text-slate-400">
                     <ArrowLeft size={24} />
                 </button>
