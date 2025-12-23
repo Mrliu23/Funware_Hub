@@ -59,8 +59,8 @@ const SupportAuthor = ({ onClose }) => {
 
     // 支付方式数据
     const paymentMethods = [
-        { id: 'wechat', name: '微信支付', nameEn: 'WeChat Pay', color: 'emerald', img: '/images/wei_pay.png' },
-        { id: 'alipay', name: '支付宝', nameEn: 'AliPay', color: 'blue', img: '/images/zhi_pay.png' },
+        { id: 'wechat', name: '微信支付', nameEn: 'WeChat Pay', color: 'emerald', img: '/images/wei_pay.jpg' },
+        { id: 'alipay', name: '支付宝', nameEn: 'AliPay', color: 'blue', img: '/images/zhi_pay.jpg' },
     ];
 
     // 容器动画变体
