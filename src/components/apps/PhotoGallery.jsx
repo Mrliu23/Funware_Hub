@@ -1,8 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ArrowLeft, Image as ImageIcon, Trash2, Layers, Heart, Share2, Download, Check } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { playSound } from '../../utils/audio';
-import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
 import { Capacitor } from '@capacitor/core';
 
@@ -20,21 +20,262 @@ const PhotoGallery = ({ onClose, onSetWallpaper }) => {
     const [viewingDirection, setViewingDirection] = useState(0); // 1 for next, -1 for prev
 
     // 1. 初始化：从本地存储加载照片
+    const [photoUrls, setPhotoUrls] = useState({});
+
+    // 懒加载图片组件：使用 IntersectionObserver 按需加载本地资源，支持原生 convertFileSrc 与 Web 回退
+    const LazyImg = ({ id, className = '', alt = '', eager = false }) => {
+        const [src, setSrc] = useState(null);
+        const [status, setStatus] = useState('idle');
+        const ref = useRef(null);
+        useEffect(() => {
+            let objectUrl = null;
+            let cancelled = false;
+            const el = ref.current;
+            if (!el && !eager) return;
+
+            const load = async () => {
+                if (cancelled) return;
+                if (!id) return;
+                setStatus('loading');
+                try {
+                    if (id.startsWith && id.startsWith('data:')) {
+                        setSrc(id);
+                        setStatus('loaded');
+                        return;
+                    }
+                    if (Capacitor.isNativePlatform()) {
+                        try {
+                            const uriRes = await Filesystem.getUri({ path: id, directory: Directory.Data });
+                            const nativeUri = uriRes && (uriRes.uri || uriRes.path || uriRes);
+                            setSrc(Capacitor.convertFileSrc(nativeUri));
+                            setStatus('loaded');
+                            return;
+                        } catch (uriErr) {
+                            setSrc(Capacitor.convertFileSrc(id));
+                            setStatus('loaded');
+                            return;
+                        }
+                    }
+                    try {
+                        const file = await Filesystem.readFile({ path: id, directory: Directory.Data });
+                        const b64 = file.data;
+                        const srcVal = b64.startsWith('data:') ? b64 : `data:image/jpeg;base64,${b64}`;
+                        setSrc(srcVal);
+                        setStatus('loaded');
+                        return;
+                    } catch (fsErr) {
+                        const resp = await fetch(id);
+                        if (!resp.ok) throw new Error('fetch failed');
+                        const blob = await resp.blob();
+                        objectUrl = URL.createObjectURL(blob);
+                        setSrc(objectUrl);
+                        setStatus('loaded');
+                        return;
+                    }
+                } catch (err) {
+                    console.error('Gallery LazyImg load failed:', id, err);
+                    setStatus('error');
+                }
+            };
+
+            if (eager) {
+                load();
+                return () => {
+                    cancelled = true;
+                    if (objectUrl) {
+                        try { URL.revokeObjectURL(objectUrl); } catch (e) { /* ignore */ }
+                    }
+                };
+            }
+
+            const io = new IntersectionObserver((entries) => {
+                entries.forEach(ent => {
+                    if (ent.isIntersecting) {
+                        load();
+                        io.disconnect();
+                    }
+                });
+            }, { rootMargin: '300px' });
+            if (el) io.observe(el);
+
+            return () => {
+                cancelled = true;
+                io.disconnect();
+                if (objectUrl) {
+                    try { URL.revokeObjectURL(objectUrl); } catch (e) { /* ignore */ }
+                }
+            };
+        }, [id, eager]);
+
+        if (status === 'error') {
+            return <div className={className + ' w-full h-full flex items-center justify-center bg-red-500/10'}><Trash2 size={32} /></div>;
+        }
+        if (!src) {
+            return <div ref={ref} className={className + ' w-full h-full animate-pulse bg-zinc-800'} />;
+        }
+        return <img ref={ref} src={src} alt={alt} className={className} onError={() => setStatus('error')} loading={eager ? undefined : "lazy"} />;
+    };
+
+    // 虚拟化网格：按行渲染，仅渲染可视区 + 预加载若干行 (适用于规则网格，如 3 列)
+    const VirtualizedGrid = ({ items, columnCount = 3, gapPx = 12, overscan = 3, renderCell }) => {
+        const containerRef = useRef(null);
+        const [viewportHeight, setViewportHeight] = useState(0);
+        const [viewportWidth, setViewportWidth] = useState(0);
+        const [scrollTop, setScrollTop] = useState(0);
+
+        useEffect(() => {
+            const el = containerRef.current;
+            if (!el) return;
+            const handleResize = () => {
+                setViewportHeight(el.clientHeight);
+                setViewportWidth(el.clientWidth);
+            };
+            handleResize();
+            const ro = new ResizeObserver(handleResize);
+            ro.observe(el);
+            return () => ro.disconnect();
+        }, []);
+
+        const onScroll = (e) => {
+            setScrollTop(e.target.scrollTop);
+        };
+
+        // 计算单元格尺寸（保持正方形）
+        const totalGap = (columnCount - 1) * gapPx;
+        const itemWidth = Math.max(0, (viewportWidth - totalGap) / columnCount);
+        const rowHeight = itemWidth;
+        const rowCount = Math.max(0, Math.ceil(items.length / columnCount));
+        const totalHeight = rowCount * (rowHeight + gapPx) - gapPx;
+
+        const startRow = Math.max(0, Math.floor(scrollTop / (rowHeight + gapPx)) - overscan);
+        const endRow = Math.min(rowCount - 1, Math.ceil((scrollTop + viewportHeight) / (rowHeight + gapPx)) + overscan);
+
+        const rows = [];
+        for (let r = startRow; r <= endRow; r++) {
+            const cols = [];
+            for (let c = 0; c < columnCount; c++) {
+                const idx = r * columnCount + c;
+                const item = items[idx];
+                cols.push(
+                    <div key={c} style={{ width: `${100 / columnCount}%`, height: rowHeight, overflow: 'hidden' }} className="">
+                        {item ? renderCell(item, idx) : <div className="w-full h-full bg-transparent" />}
+                    </div>
+                );
+            }
+            rows.push(
+                <div key={r} style={{ position: 'absolute', top: r * (rowHeight + gapPx), left: 0, right: 0, height: rowHeight, display: 'flex', gap: `${gapPx}px` }}>
+                    {cols}
+                </div>
+            );
+        }
+
+        return (
+            <div ref={containerRef} onScroll={onScroll} style={{ height: '100%', overflowY: 'auto' }} className="no-scrollbar">
+                <div style={{ height: totalHeight, position: 'relative' }}>
+                    {rows}
+                </div>
+            </div>
+        );
+    };
+
     useEffect(() => {
         const savedPhotos = localStorage.getItem('captured_photos');
         if (savedPhotos) {
-            setPhotos(JSON.parse(savedPhotos));
+            const list = JSON.parse(savedPhotos);
+            setPhotos(list);
         }
     }, []);
 
+    // 1.5 解析图片路径 (兼容 Base64 和 文件)
+    useEffect(() => {
+        const resolveUrls = async () => {
+            const newMap = { ...photoUrls };
+            let changed = false;
+
+            // 原生加速：直接将文件路径转为可被 WebView 访问的本地 URL（convertFileSrc），并移除数量限制以实现无限滚动。
+            for (const p of photos) {
+                if (newMap[p]) continue;
+
+                if (p.startsWith && p.startsWith('data:')) {
+                    newMap[p] = p;
+                    changed = true;
+                    continue;
+                }
+
+                try {
+                    if (Capacitor.isNativePlatform()) {
+                        try {
+                            const uriRes = await Filesystem.getUri({ path: p, directory: Directory.Data });
+                            const nativeUri = uriRes && (uriRes.uri || uriRes.path || uriRes);
+                            newMap[p] = Capacitor.convertFileSrc(nativeUri);
+                        } catch (uriErr) {
+                            newMap[p] = Capacitor.convertFileSrc(p);
+                        }
+                        changed = true;
+                        continue;
+                    }
+
+                    // Web fallback: try Filesystem.readFile (Base64) then fetch blob
+                    try {
+                        const file = await Filesystem.readFile({ path: p, directory: Directory.Data });
+                        const b64 = file.data;
+                        const src = b64.startsWith('data:') ? b64 : `data:image/jpeg;base64,${b64}`;
+                        newMap[p] = src;
+                        changed = true;
+                        continue;
+                    } catch (fsErr) {
+                        try {
+                            const resp = await fetch(p);
+                            if (resp.ok) {
+                                const blob = await resp.blob();
+                                newMap[p] = URL.createObjectURL(blob);
+                            } else {
+                                newMap[p] = 'error';
+                            }
+                            changed = true;
+                            continue;
+                        } catch (fetchErr) {
+                            console.error("Gallery resolve failed:", p, fetchErr);
+                            newMap[p] = 'error';
+                            changed = true;
+                            continue;
+                        }
+                    }
+                } catch (e) {
+                    console.error("Gallery resolve failed:", p, e);
+                    newMap[p] = 'error';
+                    changed = true;
+                    continue;
+                }
+            }
+
+            if (changed) setPhotoUrls(newMap);
+        };
+        resolveUrls();
+    }, [photos]);
+
     // 2. 删除照片
-    const deletePhoto = (e, index) => {
+    const deletePhoto = async (e, index) => {
         e.stopPropagation();
         setConfirmDialog({
             title: '删除照片',
             message: '这张珍贵的赛博瞬间将从手机中移除，确定吗？',
-            onConfirm: () => {
+            onConfirm: async () => {
                 playSound('1.mp3');
+                const photoToDelete = photos[index];
+
+                // 删除物理文件
+                if (photoToDelete && !photoToDelete.startsWith('data:')) {
+                    try {
+                        await Filesystem.deleteFile({
+                            path: photoToDelete,
+                            directory: Directory.Data
+                        });
+                    } catch (err) {
+                        console.warn("Delete file failed", err);
+                    }
+                }
+
                 const newPhotos = photos.filter((_, i) => i !== index);
                 setPhotos(newPhotos);
                 localStorage.setItem('captured_photos', JSON.stringify(newPhotos));
@@ -60,10 +301,33 @@ const PhotoGallery = ({ onClose, onSetWallpaper }) => {
 
             if (Capacitor.isNativePlatform()) {
                 const fileName = `CyberPhoto_${Date.now()}.jpg`;
+
+                // 读取原始数据 if needed
+                let finalData = url;
+                // 如果 url 已经是 base64 完整串 (data:image...), 这里 split 是对的
+                // 但如果是 'error' 或未加载完...
+                // 这里 url 传入的是 photos[selectedPhoto]，即文件名或Base64
+                // 不对，View 传入的是 photos[index] (文件名)
+                // 而 handleDownload 接收的是 url (文件名)
+                // 所以需要先读取文件内容
+
+                let base64Body = '';
+                if (url.startsWith('data:')) {
+                    base64Body = url.split(',')[1];
+                } else {
+                    const file = await Filesystem.readFile({
+                        path: url,
+                        directory: Directory.Data,
+                        encoding: Encoding.UTF8
+                    });
+                    const raw = file.data;
+                    base64Body = raw.startsWith('data:') ? raw.split(',')[1] : raw;
+                }
+
                 // 核心判定：文件由于系统底层写入成功
                 await Filesystem.writeFile({
                     path: fileName,
-                    data: url.split(',')[1],
+                    data: base64Body,
                     directory: Directory.Documents
                 });
 
@@ -147,20 +411,26 @@ const PhotoGallery = ({ onClose, onSetWallpaper }) => {
                         <p className="mt-6 font-black text-xs uppercase tracking-[0.5em]">存储核心为空 (Empty)</p>
                     </div>
                 ) : (
-                    <div className="grid grid-cols-3 gap-3">
-                        {photos.map((url, idx) => (
-                            <motion.div
-                                key={idx}
-                                initial={{ opacity: 0, scale: 0.9 }}
-                                animate={{ opacity: 1, scale: 1 }}
-                                transition={{ delay: idx * 0.02 }}
-                                onClick={() => { setSelectedPhoto(idx); playSound('1.mp3'); }}
-                                className="aspect-square relative rounded-xl overflow-hidden border border-white/5 bg-zinc-900 shadow-lg active:scale-95 transition-transform group"
-                            >
-                                <img src={url} alt={`照片 ${idx}`} className="w-full h-full object-cover grayscale-[0.2] group-hover:grayscale-0 transition-all duration-500" />
-                                <div className="absolute inset-0 bg-indigo-500 opacity-0 group-hover:opacity-20 transition-opacity pointer-events-none" />
-                            </motion.div>
-                        ))}
+                    <div style={{ height: '100%' }} className="">
+                        <VirtualizedGrid
+                            items={photos}
+                            columnCount={3}
+                            gapPx={12}
+                            overscan={3}
+                            renderCell={(item, idx) => (
+                                <motion.div
+                                    key={idx}
+                                    initial={{ opacity: 0, scale: 0.9 }}
+                                    animate={{ opacity: 1, scale: 1 }}
+                                    transition={{ delay: (idx % 9) * 0.01 }}
+                                    onClick={() => { setSelectedPhoto(idx); playSound('1.mp3'); }}
+                                    className="relative rounded-xl overflow-hidden border border-white/5 bg-zinc-900 shadow-lg active:scale-95 transition-transform group"
+                                >
+                                <LazyImg id={item} alt={`照片 ${idx}`} className="w-full h-full object-cover grayscale-[0.2] group-hover:grayscale-0 transition-all duration-500" eager={idx < 9} />
+                                    <div className="absolute inset-0 bg-indigo-500 opacity-0 group-hover:opacity-20 transition-opacity pointer-events-none" />
+                                </motion.div>
+                            )}
+                        />
                     </div>
                 )}
             </div>
@@ -216,10 +486,9 @@ const PhotoGallery = ({ onClose, onSetWallpaper }) => {
                                 <motion.div
                                     className="relative bg-white p-3 pb-12 shadow-[0_40px_100px_-20px_rgba(0,0,0,0.8)] rounded-sm rotate-1"
                                 >
-                                    <img
-                                        src={photos[selectedPhoto]}
-                                        className="max-w-full max-h-[60vh] object-contain shadow-inner pointer-events-none"
-                                    />
+                                    {photos[selectedPhoto] && (
+                                        <LazyImg id={photos[selectedPhoto]} className="max-w-full max-h-[60vh] object-contain shadow-inner pointer-events-none" alt="大图" eager={true} />
+                                    )}
                                     <div className="absolute bottom-4 left-6 right-6 flex flex-col gap-1 opacity-20">
                                         <div className="h-0.5 bg-black w-full" />
                                         <div className="h-0.5 bg-black w-2/3" />

@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { ArrowLeft, Camera, RefreshCw, Layers, Image as ImageIcon, Check, Trash2, Download, Monitor } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { playSound } from '../../utils/audio';
-import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
 import { Capacitor } from '@capacitor/core';
 
@@ -11,6 +11,44 @@ import { Capacitor } from '@capacitor/core';
  * 支持拍立得、复古、黑白多种模式。
  * 拍摄的照片可以实时预览、保存到手机相册（本地存档），并支持设为主屏幕壁纸。
  */
+// 色彩工具：RGB <-> HSL 转换，避免直接按通道线性拉伸导致颜色失真
+function rgbToHsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h = 0, s = 0, l = (max + min) / 2;
+    if (max !== min) {
+        const d = max - min;
+        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        switch (max) {
+            case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+            case g: h = (b - r) / d + 2; break;
+            case b: h = (r - g) / d + 4; break;
+        }
+        h /= 6;
+    }
+    return [h, s, l];
+}
+function hslToRgb(h, s, l) {
+    let r, g, b;
+    if (s === 0) {
+        r = g = b = l;
+    } else {
+        const hue2rgb = (p, q, t) => {
+            if (t < 0) t += 1;
+            if (t > 1) t -= 1;
+            if (t < 1 / 6) return p + (q - p) * 6 * t;
+            if (t < 1 / 2) return q;
+            if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+            return p;
+        };
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p = 2 * l - q;
+        r = hue2rgb(p, q, h + 1 / 3);
+        g = hue2rgb(p, q, h);
+        b = hue2rgb(p, q, h - 1 / 3);
+    }
+    return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
 const RetroCamera = ({ onClose, onSetWallpaper }) => {
     // 状态管理
     const [mode, setMode] = useState('polaroid'); // 'normal', 'polaroid', 'sketch', 'manga'
@@ -32,6 +70,7 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
     const [toast, setToast] = useState(null); // { message: string, type: 'success' | 'error' | 'info' }
     const [confirmDialog, setConfirmDialog] = useState(null); // { title: string, message: string, onConfirm: function }
     const [viewingDirection, setViewingDirection] = useState(0); // 1 for next, -1 for prev
+    const [isProcessing, setIsProcessing] = useState(false); // 处理中状态
     const lastClickTime = useRef(0);
 
     const videoRef = useRef(null);
@@ -49,8 +88,8 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
         polaroid: [
             { id: 'none', label: '经典白' },
             { id: 'vintage', label: '复古风' },
-            { id: 'fresh', label: '清新风' },
-            { id: 'dreamy', label: '梦幻风' },
+            { id: 'saturated', label: '高饱和' },     // high-saturation (用户要求的“高饱和”)
+            { id: 'lightleak', label: '漏光效果' },  // light-leak (用户要求的“漏光”)
             { id: 'warm', label: '温馨风' },
             { id: 'minimal', label: '简约风' }
         ],
@@ -58,15 +97,294 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
             { id: 'none', label: '原味' }
         ],
         manga: [
-            { id: 'none', label: '原味' }
+            { id: 'none', label: '原味' },
+            { id: 'sample', label: '样例' }
         ]
     };
 
-    // 1. 初始化：加载历史照片
+    // 懒加载图片组件：使用 IntersectionObserver 按需加载本地资源，支持原生 convertFileSrc 与 Web 回退
+    const LazyImg = ({ id, className = '', alt = '', onClick, eager = false }) => {
+        const [src, setSrc] = useState(null);
+        const [status, setStatus] = useState('idle'); // idle | loading | loaded | error
+        const ref = useRef(null);
+        useEffect(() => {
+            let objectUrl = null;
+            let cancelled = false;
+            const el = ref.current;
+            if (!el && !eager) return;
+
+            const load = async () => {
+                if (cancelled) return;
+                if (!id) return;
+                setStatus('loading');
+                try {
+                    if (id.startsWith && id.startsWith('data:')) {
+                        setSrc(id);
+                        setStatus('loaded');
+                        return;
+                    }
+                    if (Capacitor.isNativePlatform()) {
+                        try {
+                            const uriRes = await Filesystem.getUri({ path: id, directory: Directory.Data });
+                            const nativeUri = uriRes && (uriRes.uri || uriRes.path || uriRes);
+                            setSrc(Capacitor.convertFileSrc(nativeUri));
+                            setStatus('loaded');
+                            return;
+                        } catch (uriErr) {
+                            setSrc(Capacitor.convertFileSrc(id));
+                            setStatus('loaded');
+                            return;
+                        }
+                    }
+                    // Web fallback: 优先通过 Filesystem 读取 Base64（若存在），否则 fetch blob
+                    try {
+                        const file = await Filesystem.readFile({ path: id, directory: Directory.Data });
+                        const b64 = file.data;
+                        const srcVal = b64.startsWith('data:') ? b64 : `data:image/jpeg;base64,${b64}`;
+                        setSrc(srcVal);
+                        setStatus('loaded');
+                        return;
+                    } catch (fsErr) {
+                        // fetch 兜底
+                        const resp = await fetch(id);
+                        if (!resp.ok) throw new Error('fetch failed');
+                        const blob = await resp.blob();
+                        objectUrl = URL.createObjectURL(blob);
+                        setSrc(objectUrl);
+                        setStatus('loaded');
+                        return;
+                    }
+                } catch (err) {
+                    console.error('LazyImg load failed:', id, err);
+                    setStatus('error');
+                }
+            };
+
+            if (eager) {
+                load();
+                return () => {
+                    cancelled = true;
+                    if (objectUrl) {
+                        try { URL.revokeObjectURL(objectUrl); } catch (e) { /* ignore */ }
+                    }
+                };
+            }
+
+            const io = new IntersectionObserver((entries) => {
+                entries.forEach(ent => {
+                    if (ent.isIntersecting) {
+                        load();
+                        io.disconnect();
+                    }
+                });
+            }, { rootMargin: '300px' });
+            if (el) io.observe(el);
+
+            return () => {
+                cancelled = true;
+                io.disconnect();
+                if (objectUrl) {
+                    try { URL.revokeObjectURL(objectUrl); } catch (e) { /* ignore */ }
+                }
+            };
+        }, [id, eager]);
+
+        if (status === 'error') {
+            return <div className={className + ' w-full h-full flex items-center justify-center bg-red-500/10'}><Trash2 size={24} /></div>;
+        }
+        if (!src) {
+            // 占位骨架
+            return <div ref={ref} className={className + ' w-full h-full animate-pulse bg-zinc-700'} />;
+        }
+        return <img ref={ref} src={src} className={className} alt={alt} onClick={onClick} onError={() => setStatus('error')} loading={eager ? undefined : "lazy"} />;
+    };
+
+    // 存储迁移与加载逻辑
     useEffect(() => {
-        const savedPhotos = localStorage.getItem('captured_photos');
-        if (savedPhotos) setPhotos(JSON.parse(savedPhotos));
+        const loadAndMigrate = async () => {
+            try {
+                const savedRaw = localStorage.getItem('captured_photos');
+                if (!savedRaw) return;
+
+                let savedList = [];
+                try {
+                    savedList = JSON.parse(savedRaw);
+                } catch (e) {
+                    console.error("Parse failed", e);
+                    return;
+                }
+
+                if (!Array.isArray(savedList) || savedList.length === 0) return;
+
+                // 检查是否包含老数据 (Base64)
+                const hasLegacyData = savedList.some(item => item.startsWith && item.startsWith('data:image'));
+
+                if (hasLegacyData) {
+                    showToast('正在升级相册存储...', 'info');
+                    const migratedList = [];
+                    for (const item of savedList) {
+                        if (item.startsWith('data:image')) {
+                            const fname = `photo_${Date.now()}_${Math.random().toString(36).substr(2, 5)}.jpg`;
+                            try {
+                                await Filesystem.writeFile({
+                                    path: fname,
+                                    data: item,
+                                    directory: Directory.Data
+                                });
+                                migratedList.push(fname);
+                            } catch (err) {
+                                console.error("Migration write failed", err);
+                                // 失败则保留原样，防止丢图(虽然可能存不下)
+                                // migratedList.push(item); 
+                            }
+                        } else {
+                            migratedList.push(item);
+                        }
+                    }
+                    localStorage.setItem('captured_photos', JSON.stringify(migratedList));
+                    setPhotos(migratedList);
+                    showToast('相册升级完成！', 'success');
+                } else {
+                    setPhotos(savedList);
+                }
+            } catch (err) {
+                console.error("Load photos failed:", err);
+            }
+        };
+        loadAndMigrate();
     }, []);
+
+    // 辅助：获取图片显示路径
+    const [photoUrls, setPhotoUrls] = useState({}); // 缓存 filepath -> url 映射
+
+    useEffect(() => {
+        const resolveUrls = async () => {
+            const newMap = { ...photoUrls };
+            let changed = false;
+
+            // 原生加速模式：不再逐字节读取文件，直接让 WebView 使用本地文件流。
+            // 不对照片数量做截断（无限滚动/全部显示），在原生平台使用 convertFileSrc 提供高速本地访问。
+            for (const p of photos) {
+                    if (!newMap[p]) {
+                    if (p.startsWith && p.startsWith('data:')) {
+                        newMap[p] = p;
+                        changed = true;
+                    } else {
+                        try {
+                                if (Capacitor.isNativePlatform()) {
+                                    // Native: obtain the native URI for the saved file and convert it to a WebView-safe src
+                                    try {
+                                        const uriRes = await Filesystem.getUri({ path: p, directory: Directory.Data });
+                                        const nativeUri = uriRes && (uriRes.uri || uriRes.path || uriRes);
+                                        newMap[p] = Capacitor.convertFileSrc(nativeUri);
+                                    } catch (uriErr) {
+                                        // fallback: try convertFileSrc with the raw path (older platforms)
+                                        newMap[p] = Capacitor.convertFileSrc(p);
+                                    }
+                                    changed = true;
+                                } else {
+                                // Web fallback: try to read Base64 via Filesystem, otherwise fetch as blob
+                                try {
+                                    const file = await Filesystem.readFile({
+                                        path: p,
+                                        directory: Directory.Data
+                                    });
+                                    const b64 = file.data;
+                                    const src = b64.startsWith('data:') ? b64 : `data:image/jpeg;base64,${b64}`;
+                                    newMap[p] = src;
+                                    changed = true;
+                                } catch (fsErr) {
+                                    // 最后兜底：尝试通过 fetch 获取（开发环境）
+                                    try {
+                                        const resp = await fetch(p);
+                                        if (resp.ok) {
+                                            const blob = await resp.blob();
+                                            newMap[p] = URL.createObjectURL(blob);
+                                            changed = true;
+                                        } else {
+                                            newMap[p] = 'error';
+                                            changed = true;
+                                        }
+                                    } catch (fetchErr) {
+                                        console.error("Resolve failed:", p, fetchErr);
+                                        newMap[p] = 'error';
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            console.error("Resolve failed:", p, e);
+                            newMap[p] = 'error';
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if (changed) setPhotoUrls(newMap);
+        };
+        resolveUrls();
+    }, [photos]);
+
+    // 虚拟化网格：按行渲染，仅渲染可视区 + 预加载若干行 (适用于规则网格，如 3 列)
+    const VirtualizedGrid = ({ items, columnCount = 3, gapPx = 4, overscan = 3, renderCell }) => {
+        const containerRef = useRef(null);
+        const [viewportHeight, setViewportHeight] = useState(0);
+        const [viewportWidth, setViewportWidth] = useState(0);
+        const [scrollTop, setScrollTop] = useState(0);
+
+        useEffect(() => {
+            const el = containerRef.current;
+            if (!el) return;
+            const handleResize = () => {
+                setViewportHeight(el.clientHeight);
+                setViewportWidth(el.clientWidth);
+            };
+            handleResize();
+            const ro = new ResizeObserver(handleResize);
+            ro.observe(el);
+            return () => ro.disconnect();
+        }, []);
+
+        const onScroll = (e) => {
+            setScrollTop(e.target.scrollTop);
+        };
+
+        const totalGap = (columnCount - 1) * gapPx;
+        const itemWidth = Math.max(0, (viewportWidth - totalGap) / columnCount);
+        const rowHeight = itemWidth;
+        const rowCount = Math.max(0, Math.ceil(items.length / columnCount));
+        const totalHeight = rowCount * (rowHeight + gapPx) - gapPx;
+
+        const startRow = Math.max(0, Math.floor(scrollTop / (rowHeight + gapPx)) - overscan);
+        const endRow = Math.min(rowCount - 1, Math.ceil((scrollTop + viewportHeight) / (rowHeight + gapPx)) + overscan);
+
+        const rows = [];
+        for (let r = startRow; r <= endRow; r++) {
+            const cols = [];
+            for (let c = 0; c < columnCount; c++) {
+                const idx = r * columnCount + c;
+                const item = items[idx];
+                cols.push(
+                    <div key={c} style={{ width: `${100 / columnCount}%`, height: rowHeight, overflow: 'hidden' }} className="">
+                        {item ? renderCell(item, idx) : <div className="w-full h-full bg-transparent" />}
+                    </div>
+                );
+            }
+            rows.push(
+                <div key={r} style={{ position: 'absolute', top: r * (rowHeight + gapPx), left: 0, right: 0, height: rowHeight, display: 'flex', gap: `${gapPx}px` }}>
+                    {cols}
+                </div>
+            );
+        }
+
+        return (
+            <div ref={containerRef} onScroll={onScroll} style={{ height: '100%', overflowY: 'auto' }} className="no-scrollbar">
+                <div style={{ height: totalHeight, position: 'relative' }}>
+                    {rows}
+                </div>
+            </div>
+        );
+    };
 
     // 2. 启动摄像头 (升级版：请求高分辨率与检测能力)
     const startCamera = async () => {
@@ -228,8 +546,8 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
 
             // --- 拍立得变体 ---
             case 'vintage': return { ...baseStyle, filter: 'sepia(0.5) contrast(0.9) brightness(0.9) saturate(0.8) blur(0.5px)' };
-            case 'fresh': return { ...baseStyle, filter: 'saturate(1.5) brightness(1.1) contrast(1.1) hue-rotate(-10deg)' };
-            case 'dreamy': return { ...baseStyle, filter: 'brightness(1.1) contrast(0.8) saturate(0.9) hue-rotate(10deg) blur(1px)' };
+            case 'saturated': return { ...baseStyle, filter: 'saturate(1.6) brightness(1.05) contrast(1.15) hue-rotate(-6deg)' };
+            case 'lightleak': return { ...baseStyle, filter: 'brightness(1.08) contrast(0.95) saturate(1.05) hue-rotate(6deg) blur(0.8px)' };
             case 'warm': return { ...baseStyle, filter: 'sepia(0.2) saturate(1.4) brightness(1.0) contrast(0.9)' };
             case 'minimal': return { ...baseStyle, filter: 'contrast(1.2) saturate(0.7) brightness(1.1)' };
 
@@ -246,6 +564,12 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
     const applyPixelFilter = (ctx, width, height) => {
         const imageData = ctx.getImageData(0, 0, width, height);
         const data = imageData.data;
+        // 快照当前画布到独立 baseCanvas，避免在后续合成时从同一 ctx 读取导致自我叠加/变黑
+        const baseCanvas = document.createElement('canvas');
+        baseCanvas.width = width;
+        baseCanvas.height = height;
+        const baseCtx = baseCanvas.getContext('2d');
+        baseCtx.putImageData(imageData, 0, 0);
         const total = data.length;
 
         // --- 获取当前实际应用的滤镜模式 ---
@@ -267,12 +591,18 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
                     // 复古：偏棕黄，低对比
                     r = r * 0.9 + 20; g = g * 0.8 + 10; b = b * 0.7;
                     r = Math.min(255, r * 1.1);
-                } else if (effectiveMode === 'fresh') {
-                    // 清新：高亮度，高饱和，偏蓝
-                    r *= 1.1; g *= 1.1; b *= 1.25;
-                } else if (effectiveMode === 'dreamy') {
-                    // 梦幻：高亮度，低对比，偏蓝紫
-                    r = r * 0.8 + 50; g = g * 0.8 + 50; b = b * 1.0 + 30;
+                } else if (effectiveMode === 'saturated') {
+                    // 高饱和：增强色彩对比与亮度
+                    r = Math.min(255, r * 1.25);
+                    g = Math.min(255, g * 1.25);
+                    b = Math.min(255, b * 1.45);
+                    // 轻微对比拉伸
+                    r = ((r - 128) * 1.08) + 128;
+                    g = ((g - 128) * 1.08) + 128;
+                    b = ((b - 128) * 1.08) + 128;
+                } else if (effectiveMode === 'lightleak') {
+                    // 漏光：局部偏色与亮斑（后处理在帧上模拟）
+                    r = r * 0.88 + 30; g = g * 0.85 + 20; b = b * 0.92 + 10;
                 } else if (effectiveMode === 'warm') {
                     // 温馨：偏红橙，柔和
                     r = r * 1.1 + 10; g = g * 0.95 + 5; b *= 0.9;
@@ -291,6 +621,12 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
                 data[i + 2] = Math.min(255, Math.max(0, b * 0.95 + 5 + noise));
             }
             ctx.putImageData(imageData, 0, 0);
+            // 为后续合成准备处理后的基底快照（使用已写回 ctx 的像素）
+            const procBaseCanvas = document.createElement('canvas');
+            procBaseCanvas.width = width;
+            procBaseCanvas.height = height;
+            const procBaseCtx = procBaseCanvas.getContext('2d');
+            procBaseCtx.drawImage(ctx.canvas, 0, 0);
         }
 
         // === 专业艺术素描：极致笔法 (Hatching, Stippling, Charcoal) + 康颂纸纹理 ===
@@ -333,87 +669,158 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
             }
             ctx.putImageData(paperData, 0, 0);
 
-            // 4. 程序化笔触渲染 (Extreme Strokes)
-            const step = width > 2000 ? 12 : 6;
-            ctx.lineCap = 'round';
-            ctx.lineJoin = 'round';
+            // 4. 程序化笔触渲染 -> 改为基于边缘图的干净线稿渲染，保持纸张质感
+            // 将边缘数组转换为独立线稿图层，再叠加以获得更清晰的黑线效果
+            const edgeThreshold = 28; // 边缘阈值，越低线越多
+            const lineCanvas = document.createElement('canvas');
+            lineCanvas.width = width;
+            lineCanvas.height = height;
+            const lctx = lineCanvas.getContext('2d');
+            // 透明背景
+            lctx.clearRect(0, 0, width, height);
 
-            for (let y = 0; y < height; y += step) {
-                for (let x = 0; x < width; x += step) {
+            // 直接写像素到线稿图层
+            const lineImg = lctx.createImageData(width, height);
+            const lineBuf = lineImg.data;
+            for (let i = 0; i < width * height; i++) {
+                const v = edges[i];
+                if (v > edgeThreshold) {
+                    // 边缘强度映射到 alpha
+                    const alpha = Math.min(255, Math.floor((v / 255) * 255 * 1.2));
+                    const off = i * 4;
+                    lineBuf[off] = 0;
+                    lineBuf[off + 1] = 0;
+                    lineBuf[off + 2] = 0;
+                    lineBuf[off + 3] = alpha;
+                } else {
+                    // 透明
+                    const off = i * 4;
+                    lineBuf[off] = 0; lineBuf[off + 1] = 0; lineBuf[off + 2] = 0; lineBuf[off + 3] = 0;
+                }
+            }
+            lctx.putImageData(lineImg, 0, 0);
+
+            // 稍微膨胀线条以模拟笔触粗细：通过多次偏移绘制自身实现
+            ctx.save();
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.globalAlpha = 1.0;
+            // 在主画布上先绘制一遍线稿（较弱），再绘制多次偏移以加粗关键线条
+            ctx.drawImage(lineCanvas, 0, 0);
+            const offsets = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [1, 1]];
+            ctx.globalAlpha = 0.9;
+            for (let k = 0; k < offsets.length; k++) {
+                const o = offsets[k];
+                ctx.drawImage(lineCanvas, o[0], o[1]);
+            }
+            ctx.restore();
+
+            // 小量的擦拭/炭笔效果：在暗部叠加少量随机笔触提高质感
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.globalAlpha = 0.06;
+            ctx.fillStyle = '#000';
+            const grainStep = Math.max(3, Math.round(Math.min(width, height) / 300));
+            for (let y = 0; y < height; y += grainStep) {
+                for (let x = 0; x < width; x += grainStep) {
                     const idx = y * width + x;
-                    const gVal = gray[idx];
-                    const eVal = edges[idx];
-
-                    // --- A. 点画法 (Stippling)：亮部细节 ---
-                    if (gVal > 200 && gVal < 240 && Math.random() > 0.7) {
-                        ctx.fillStyle = 'rgba(60, 60, 60, 0.3)';
-                        ctx.beginPath();
-                        ctx.arc(x + Math.random() * step, y + Math.random() * step, 0.5, 0, Math.PI * 2);
-                        ctx.fill();
-                    }
-
-                    // --- B. 十字排线 (Cross-hatching)：灰部体积感 ---
-                    if (gVal < 180) {
-                        ctx.strokeStyle = `rgba(40, 40, 40, ${0.4 * (1 - gVal / 180)})`;
-                        ctx.lineWidth = width > 2000 ? 1 : 0.5;
-                        ctx.beginPath();
-                        const jitter = (Math.random() - 0.5) * step * 0.4;
-                        ctx.moveTo(x + jitter, y);
-                        ctx.lineTo(x + step + jitter, y + step);
-                        ctx.stroke();
-
-                        if (gVal < 100) {
-                            ctx.beginPath();
-                            ctx.moveTo(x + step + jitter, y);
-                            ctx.lineTo(x + jitter, y + step);
-                            ctx.stroke();
-                        }
-                    }
-
-                    // --- C. 炭笔质感 (Charcoal Smudging)：暗部与乱线条 ---
-                    if (gVal < 50) {
-                        ctx.strokeStyle = `rgba(10, 10, 10, ${0.6 * (1 - gVal / 50)})`;
-                        ctx.lineWidth = width > 2000 ? 3 : 1.5;
-                        ctx.beginPath();
-                        ctx.moveTo(x, y);
-                        ctx.bezierCurveTo(x + step, y, x, y + step, x + step, y + step);
-                        ctx.stroke();
-                    }
-
-                    // --- D. 轮廓强化 (Bold Contour) ---
-                    if (eVal > 60) {
-                        ctx.strokeStyle = `rgba(0, 0, 0, ${Math.min(0.8, eVal / 100)})`;
-                        ctx.lineWidth = width > 2000 ? 2 : 1;
-                        ctx.beginPath();
-                        ctx.moveTo(x, y);
-                        ctx.lineTo(x + step * 0.5, y + step * 0.5);
-                        ctx.stroke();
+                    if (gray[idx] < 80 && Math.random() > 0.88) {
+                        ctx.fillRect(x + (Math.random() - 0.5) * 2, y + (Math.random() - 0.5) * 2, 1, 1);
                     }
                 }
             }
+            ctx.globalAlpha = 1.0;
         }
 
         // === 专业艺术漫画：现代商业渲染 (Cel Shading, Rim Lighting, Bloom) ===
         else if (effectiveMode === 'manga') {
-            // 1. 颜色工程：赛璐璐上色 (Cel Shading) 与 超级饱和
+            // 针对“样例漫画”(sample) 模式：独立处理，保证绝对真实色彩 + 漫画覆盖层
+            if (mangaEffect === 'sample') {
+                // 1. 底图：直接使用原图 (baseCanvas)，重置 ctx
+                ctx.drawImage(baseCanvas, 0, 0);
+                const width = ctx.canvas.width;
+                const height = ctx.canvas.height;
+
+                // 2. 黑白网点 (Halftone)
+                const dotCanvasS = document.createElement('canvas');
+                dotCanvasS.width = width; dotCanvasS.height = height;
+                const dCtxS = dotCanvasS.getContext('2d');
+                const sampleData = baseCanvas.getContext('2d').getImageData(0, 0, width, height).data;
+                // 网点大小
+                // 网点大小：非常小，细腻质感
+                const gsizeS = Math.max(2, Math.round(Math.min(width, height) / 160));
+                dCtxS.fillStyle = 'black';
+
+                for (let y = 0; y < height; y += gsizeS) {
+                    for (let x = 0; x < width; x += gsizeS) {
+                        const idx = (y * width + x) * 4;
+                        const bri = (sampleData[idx] + sampleData[idx + 1] + sampleData[idx + 2]) / 3;
+                        // 仅在暗部显示网点
+                        if (bri < 230) {
+                            const radius = (1 - (bri / 255)) * (gsizeS / 1.6);
+                            if (radius > 0.5) {
+                                dCtxS.beginPath();
+                                dCtxS.arc(x + gsizeS / 2, y + gsizeS / 2, radius, 0, Math.PI * 2);
+                                dCtxS.fill();
+                            }
+                        }
+                    }
+                }
+                // 叠加网点
+                ctx.globalCompositeOperation = 'source-over';
+                ctx.drawImage(dotCanvasS, 0, 0);
+
+                // 3. 强力墨线 (Thick Ink Lines) - 独立计算
+                const lCanvas = document.createElement('canvas');
+                lCanvas.width = width; lCanvas.height = height;
+                const lCtx = lCanvas.getContext('2d');
+                const lineImg = lCtx.createImageData(width, height);
+                const lb = lineImg.data;
+
+                for (let y = 1; y < height - 1; y++) {
+                    for (let x = 1; x < width - 1; x++) {
+                        const idx = (y * width + x) * 4;
+                        const getBri = (i) => (sampleData[i] + sampleData[i + 1] + sampleData[i + 2]) / 3;
+                        const c = getBri(idx);
+                        const r = getBri(idx + 4);
+                        const b = getBri(idx + width * 4);
+                        if (Math.abs(c - r) + Math.abs(c - b) > 50) {
+                            lb[idx + 3] = 255;
+                        }
+                    }
+                }
+                lCtx.putImageData(lineImg, 0, 0);
+
+                const offsets = [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [2, 0], [-2, 0], [0, 2], [0, -2]];
+                for (let o of offsets) {
+                    ctx.drawImage(lCanvas, o[0], o[1]);
+                }
+
+                // 4. 速度线 & 5. BAM Text 已按用户要求移除，保持画面纯净
+
+
+                return; // 结束处理，跳过后续所有逻辑
+            }
+
+            // 1. 颜色工程：赛璐璐上色 (Cel Shading) 与 强对比平涂
             for (let i = 0; i < total; i += 4) {
                 let r = data[i], g = data[i + 1], b = data[i + 2];
 
-                // 1.1 极致饱和度提升
-                const avg = (r + g + b) / 3;
-                r = avg + (r - avg) * 2.2;
-                g = avg + (g - avg) * 2.2;
-                b = avg + (b - avg) * 2.2;
+                // 使用 HSL 调色以保持色相稳定并提高饱和度（避免直接按通道拉伸导致颜色失真）
+                const [h, s, l] = rgbToHsl(r, g, b);
+                const newS = Math.min(1, s * 1.35); // 适度提高饱和
+                // 轻微提升对比（通过 L 值非线性映射）
+                const newL = l < 0.5 ? Math.pow(l, 0.92) : 1 - Math.pow(1 - l, 0.92);
+                const [nr, ng, nb] = hslToRgb(h, newS, newL);
 
-                // 1.2 赛璐璐分层 (Cel Levels)
-                const levels = 4;
-                r = Math.floor(r / (256 / levels)) * (256 / levels);
-                g = Math.floor(g / (256 / levels)) * (256 / levels);
-                b = Math.floor(b / (256 / levels)) * (256 / levels);
+                // 赛璐璐分层 (更明显的平涂分块)，在 HSL 调整后对通道量化
+                const levels = 3;
+                const step = 256 / levels;
+                r = Math.floor(nr / step) * step;
+                g = Math.floor(ng / step) * step;
+                b = Math.floor(nb / step) * step;
 
-                data[i] = Math.min(255, r);
-                data[i + 1] = Math.min(255, g);
-                data[i + 2] = Math.min(255, b);
+                data[i] = Math.min(255, Math.max(0, r));
+                data[i + 1] = Math.min(255, Math.max(0, g));
+                data[i + 2] = Math.min(255, Math.max(0, b));
             }
             ctx.putImageData(imageData, 0, 0);
 
@@ -421,10 +828,11 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
             const edgeCanvas = document.createElement('canvas');
             edgeCanvas.width = width; edgeCanvas.height = height;
             const eCtx = edgeCanvas.getContext('2d');
-            eCtx.drawImage(ctx.canvas, 0, 0);
+            // 使用已处理的基底快照进行边缘提取，避免读取被修改的 ctx 导致不稳定合成
+            eCtx.drawImage(procBaseCanvas || baseCanvas, 0, 0);
             const eData = eCtx.getImageData(0, 0, width, height).data;
 
-            // 3. 细节合成 (Compositing)
+            // 3. 细节合成 (Compositing)：更强的墨线与选择性网点
             const gridSize = width > 2000 ? 12 : 6;
 
             for (let y = 0; y < height; y += gridSize) {
@@ -433,31 +841,31 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
                     const r = eData[idx], g = eData[idx + 1], b = eData[idx + 2];
                     const br = (r + g + b) / 3;
 
-                    // --- A. 极致网点 (Halftone Patterns) ---
-                    if (br < 140) {
-                        const radius = (1 - br / 255) * (gridSize / 2) * 1.1;
-                        ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+                    // --- A. 网点 (Halftone)：仅在暗部绘制，增强漫画质感 ---
+                    if (br < 150) {
+                        const radius = (1 - br / 255) * (gridSize / 2) * 1.2;
+                        ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
                         ctx.beginPath();
                         ctx.arc(x + gridSize / 2, y + gridSize / 2, radius, 0, Math.PI * 2);
                         ctx.fill();
                     }
 
-                    // --- B. 动态墨迹勾边 (Bold Ink Outlines) ---
-                    const dR = Math.abs(eData[idx] - eData[idx + 4]) + Math.abs(eData[idx + 1] - eData[idx + 5]);
-                    const dB = Math.abs(eData[idx] - eData[idx + width * 4]) + Math.abs(eData[idx + 1] - eData[idx + width * 4 + 1]);
-                    if (dR > 80 || dB > 80) {
+                    // --- B. 动态墨迹勾边：更明显的黑色笔触 ---
+                    const rightIdx = idx + 4 < eData.length ? idx + 4 : idx;
+                    const bottomIdx = idx + width * 4 < eData.length ? idx + width * 4 : idx;
+                    const dR = Math.abs(eData[idx] - eData[rightIdx]) + Math.abs(eData[idx + 1] - eData[rightIdx + 1]) + Math.abs(eData[idx + 2] - eData[rightIdx + 2]);
+                    const dB = Math.abs(eData[idx] - eData[bottomIdx]) + Math.abs(eData[idx + 1] - eData[bottomIdx + 1]) + Math.abs(eData[idx + 2] - eData[bottomIdx + 2]);
+                    if (dR > 60 || dB > 60) {
                         ctx.fillStyle = 'black';
-                        // 根据边缘强度模拟压感粗细
-                        const weight = Math.min(gridSize, (dR + dB) / 100 * (width > 2000 ? 4 : 2));
-                        ctx.fillRect(x, y, weight, weight);
+                        const weight = Math.min(gridSize * 0.9, ((dR + dB) / 150) * (width > 2000 ? 6 : 3));
+                        ctx.fillRect(x, y, Math.max(1, Math.round(weight)), Math.max(1, Math.round(weight)));
                     }
 
-                    // --- C. 轮廓光 (Rim Lighting) 模拟 ---
-                    // 在极暗背景下的亮部边缘增加溢光
-                    if (br > 200 && (x < 20 || x > width - 20 || y < 20 || y > height - 20)) {
-                        ctx.shadowBlur = 15;
-                        ctx.shadowColor = 'white';
-                        ctx.fillStyle = 'white';
+                    // --- C. 轮廓光 (Rim Lighting)：边缘高亮以凸显人物轮廓 ---
+                    if (br > 210 && (x < 20 || x > width - 20 || y < 20 || y > height - 20)) {
+                        ctx.shadowBlur = 18;
+                        ctx.shadowColor = 'rgba(255,255,255,0.6)';
+                        ctx.fillStyle = 'rgba(255,255,255,0.55)';
                         ctx.fillRect(x, y, gridSize, gridSize);
                         ctx.shadowBlur = 0;
                     }
@@ -467,198 +875,348 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
             // 4. 后期特效：轻微溢光 (Bloom)
             ctx.globalCompositeOperation = 'screen';
             ctx.globalAlpha = 0.15;
-            ctx.drawImage(ctx.canvas, 0, 0); // 自叠加产生柔光
+            // 使用 baseCanvas 快照进行柔光叠加，避免对当前正在绘制的 ctx 自身叠加
+            ctx.drawImage(baseCanvas, 0, 0); // 自叠加产生柔光
             ctx.globalCompositeOperation = 'source-over';
             ctx.globalAlpha = 1.0;
+
+            // 5. 速度线已移除为默认行为，只有在特定子风格（如 pop）内生成
+
+            // 6. 可选：添加漫画文字贴纸（默认小幅度展示，若不需要可删除）
+            try {
+                ctx.save();
+                const fontSize = Math.round(Math.min(width, height) / 8);
+                ctx.font = `bold ${fontSize}px Impact, "Arial Black", sans-serif`;
+                // 漫画贴纸默认关闭，若需要请将 text 变量取消注释或替换为动态文本
+                // const text = 'BAM!';
+                const tx = Math.round(width * 0.62);
+                const ty = Math.round(height * 0.72);
+                // 描边白色填充黑边（示例注释掉实际文字）
+                // ctx.lineWidth = Math.max(6, Math.round(fontSize / 8));
+                // ctx.strokeStyle = 'black';
+                // ctx.fillStyle = 'white';
+                // ctx.strokeText(text, tx, ty);
+                // ctx.fillText(text, tx, ty);
+                ctx.restore();
+            } catch (e) {
+                console.debug('Comic text overlay skipped:', e);
+            }
+
+            // 7. 漫画子风格扩展已移除 (按用户要求简化为仅保留原味和样例)
+
         }
     };
 
     // 4. 拍照核心逻辑
     const takePhoto = () => {
-        if (!videoRef.current || !canvasRef.current) return;
+        // 移除 canvasRef 检查 (它其实只是个隐藏的 buffer，不一定非要 mounting 时立即存在，可以在 process 时创建)
+        // 增加 readyState 检查：防止在视频流尚未准备好时点击拍照导致“无反应”或黑屏
+        if (!videoRef.current || videoRef.current.readyState < 2) {
+            showToast('相机正在预热...', 'info');
+            return;
+        }
 
-        setIsShutterActive(true);
+        // 立即触发音效 (Removed Flash Animation)
         playSound('1.mp3');
-        setTimeout(() => setIsShutterActive(false), 200);
+        setIsProcessing(true);
 
-        const video = videoRef.current;
-        const canvas = canvasRef.current;
-        const ctx = canvas.getContext('2d');
 
-        // 开启最高清晰度渲染
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
+        // 使用 setTimeout 将繁重的图像处理推迟到下一帧，
+        // 让 React 有机会先渲染快门动画 (IsShutterActive)，如果不这样做，
+        // 繁重的同步计算会阻塞主线程，导致 UI 卡住，看不到闪光效果。
+        setTimeout(() => {
+            try {
+                const video = videoRef.current;
+                // 使用独立的 finalCanvas 完成所有绘制与合成，避免修改到 UI canvas 带来副作用
+                const finalCanvas = document.createElement('canvas');
+                finalCanvas.width = video.videoWidth;
+                finalCanvas.height = video.videoHeight;
+                const fCtx = finalCanvas.getContext('2d');
+                // 开启最高清晰度渲染
+                fCtx.imageSmoothingEnabled = true;
+                fCtx.imageSmoothingQuality = 'high';
 
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+                // 检测当前是否使用了硬件缩放
+                const hasHardwareZoom = capabilities?.zoom && stream;
 
-        // 检测当前是否使用了硬件缩放
-        const hasHardwareZoom = capabilities?.zoom && stream;
+                // 绘制原图到 finalCanvas
+                if (hasHardwareZoom) {
+                    // 如果是硬件变焦，视频流已经是放大后的，直接全屏绘制
+                    fCtx.drawImage(video, 0, 0, finalCanvas.width, finalCanvas.height);
+                } else {
+                    // 传统数字变焦：手动裁切中心
+                    const sw = video.videoWidth / zoom;
+                    const sh = video.videoHeight / zoom;
+                    const sx = (video.videoWidth - sw) / 2;
+                    const sy = (video.videoHeight - sh) / 2;
+                    fCtx.drawImage(video, sx, sy, sw, sh, 0, 0, finalCanvas.width, finalCanvas.height);
+                }
 
-        // 绘制原图
-        if (hasHardwareZoom) {
-            // 如果是硬件变焦，视频流已经是放大后的，直接全屏绘制
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        } else {
-            // 传统数字变焦：手动裁切中心
-            const sw = video.videoWidth / zoom;
-            const sh = video.videoHeight / zoom;
-            const sx = (video.videoWidth - sw) / 2;
-            const sy = (video.videoHeight - sh) / 2;
-            ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
-        }
+                // 拍立得色彩处理 (简单滤镜)
+                if (mode === 'polaroid') {
+                    fCtx.filter = 'sepia(30%) contrast(110%) brightness(110%)';
+                    if (hasHardwareZoom) {
+                        fCtx.drawImage(video, 0, 0, finalCanvas.width, finalCanvas.height);
+                    } else {
+                        const sw = video.videoWidth / zoom;
+                        const sh = video.videoHeight / zoom;
+                        const sx = (video.videoWidth - sw) / 2;
+                        const sy = (video.videoHeight - sh) / 2;
+                        fCtx.drawImage(video, sx, sy, sw, sh, 0, 0, finalCanvas.width, finalCanvas.height);
+                    }
+                    fCtx.filter = 'none';
+                }
 
-        // 拍立得色彩处理 (简单滤镜)
-        if (mode === 'polaroid') {
-            ctx.filter = 'sepia(30%) contrast(110%) brightness(110%)';
-            if (hasHardwareZoom) {
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            } else {
-                const sw = video.videoWidth / zoom;
-                const sh = video.videoHeight / zoom;
-                const sx = (video.videoWidth - sw) / 2;
-                const sy = (video.videoHeight - sh) / 2;
-                ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+                // 高级像素处理 (素描/漫画/各种幻想效果)
+                const hasPixelFilter = mode === 'sketch' || mode === 'manga' ||
+                    (mode === 'polaroid' && polaroidEffect !== 'none') ||
+                    (mode === 'sketch' && sketchEffect !== 'none') ||
+                    (mode === 'manga' && mangaEffect !== 'none');
+                if (hasPixelFilter) {
+                    try {
+                        // 在 finalCanvas 上应用像素级滤镜
+                        applyPixelFilter(fCtx, finalCanvas.width, finalCanvas.height);
+                    } catch (err) {
+                        console.error('applyPixelFilter failed:', err);
+                        // 如果滤镜失败，继续使用未滤镜的 finalCanvas
+                    }
+                }
+
+                let finalDataUrl;
+
+                // 拍立得效果：根据子选项生成各种变异边框
+                if (mode === 'polaroid') {
+                    const frameCanvas = document.createElement('canvas');
+                    const fCtx2 = frameCanvas.getContext('2d');
+                    const padding = finalCanvas.width * 0.08;
+                    const bottomSpace = finalCanvas.width * 0.28;
+
+                    frameCanvas.width = finalCanvas.width + padding * 2;
+                    frameCanvas.height = finalCanvas.height + padding + bottomSpace;
+                    const fw = frameCanvas.width;
+                    const fh = frameCanvas.height;
+
+                    const effect = polaroidEffect;
+
+                    // 1. 基础背景绘制
+                    // 1. 基础背景绘制 (经典自尊白)
+                    fCtx2.fillStyle = '#fdfdfd';
+                    fCtx2.fillRect(0, 0, fw, fh);
+
+                    // 风格特定背景/边框装饰
+                    if (effect === 'vintage') {
+                        // 复古：微微泛黄的旧纸感
+                        fCtx2.fillStyle = 'rgba(255, 200, 50, 0.05)';
+                        fCtx2.fillRect(0, 0, fw, fh);
+                        // 模拟漏光效果
+                        const grd = fCtx2.createLinearGradient(0, 0, fw, 0);
+                        grd.addColorStop(0, 'rgba(255, 50, 0, 0)');
+                        grd.addColorStop(0.5, 'rgba(255, 50, 0, 0.1)');
+                        grd.addColorStop(1, 'rgba(255, 50, 0, 0)');
+                        fCtx2.fillStyle = grd;
+                        fCtx2.fillRect(0, 0, fw, fh);
+                    } else if (effect === 'saturated') {
+                        // 高饱和：增强边框亮度与光泽
+                        fCtx2.fillStyle = 'rgba(255, 255, 255, 0.9)';
+                        fCtx2.fillRect(0, 0, fw, fh);
+                        fCtx2.strokeStyle = 'rgba(255,240,220,0.2)';
+                        fCtx2.lineWidth = 2;
+                        fCtx2.strokeRect(padding / 2, padding / 2, fw - padding, fh - padding);
+                        // 增加轻微辉光效果
+                        fCtx2.globalAlpha = 0.06;
+                        fCtx2.fillStyle = 'rgba(255,220,180,0.5)';
+                        fCtx2.fillRect(0, 0, fw, fh);
+                        fCtx2.globalAlpha = 1.0;
+                    } else if (effect === 'lightleak') {
+                        // 漏光：模拟侧向红色/橙色光晕
+                        fCtx2.fillStyle = 'rgba(0,0,0,0)';
+                        fCtx2.fillRect(0, 0, fw, fh);
+                        const lg = fCtx2.createLinearGradient(0, 0, fw * 0.6, fh * 0.3);
+                        lg.addColorStop(0, 'rgba(255,120,60,0.0)');
+                        lg.addColorStop(0.35, 'rgba(255,100,40,0.12)');
+                        lg.addColorStop(0.6, 'rgba(255,80,20,0.08)');
+                        lg.addColorStop(1, 'rgba(255,80,20,0.0)');
+                        fCtx2.globalCompositeOperation = 'screen';
+                        fCtx2.fillStyle = lg;
+                        fCtx2.fillRect(0, 0, fw, fh);
+                        fCtx2.globalCompositeOperation = 'source-over';
+
+                    } else if (effect === 'warm') {
+                        // 温馨：由于像素处理已偏暖，此处加一个淡淡的橙色晕染
+                        fCtx2.fillStyle = 'rgba(255, 100, 0, 0.02)';
+                        fCtx2.fillRect(0, 0, fw, fh);
+                    }
+
+                    // 2. 绘制相片主体（使用 finalCanvas）
+                    fCtx2.drawImage(finalCanvas, padding, padding);
+
+                    // 3. 细节装饰：颗粒与物理真实感
+                    fCtx2.globalAlpha = 0.03;
+                    fCtx2.fillStyle = '#000';
+                    for (let i = 0; i < fw; i += 5) fCtx2.fillRect(i, 0, 1, fh); // 细微扫描线
+                    fCtx2.globalAlpha = 1.0;
+
+                    // 给照片本体加一个非常细的灰色描边，模拟纸张边缘
+                    fCtx2.strokeStyle = 'rgba(0,0,0,0.1)';
+                    fCtx2.lineWidth = 1;
+                    fCtx2.strokeRect(padding, padding, finalCanvas.width, finalCanvas.height);
+
+                    // 3. 全局纹理覆盖 (所有变异增加一张颗粒感网格)
+                    fCtx2.globalAlpha = 0.05;
+                    fCtx2.fillStyle = '#000';
+                    for (let i = 0; i < fw; i += 4) fCtx2.fillRect(i, 0, 1, fh);
+                    fCtx2.globalAlpha = 1.0;
+
+                    finalDataUrl = frameCanvas.toDataURL('image/jpeg', 0.85);
+                } else {
+                    finalDataUrl = finalCanvas.toDataURL('image/jpeg', 0.90);
+                }
+
+                setCapturedImage(finalDataUrl);
+            } catch (err) {
+                console.error("Capture failed:", err);
+                showToast('拍摄出错: ' + err.message, 'error');
+            } finally {
+                setIsProcessing(false); // 结束处理状态
             }
-            ctx.filter = 'none';
-        }
-
-        // 高级像素处理 (素描/漫画/各种幻想效果)
-        const hasPixelFilter = mode === 'sketch' || mode === 'manga' ||
-            (mode === 'polaroid' && polaroidEffect !== 'none') ||
-            (mode === 'sketch' && sketchEffect !== 'none') ||
-            (mode === 'manga' && mangaEffect !== 'none');
-        if (hasPixelFilter) {
-            applyPixelFilter(ctx, canvas.width, canvas.height);
-        }
-
-        let finalDataUrl;
-
-        const isFantasyMode = ['soul', 'neon', 'candy', 'abyssal', 'glitch', 'thermal', 'fungi', 'prism', 'noir', 'weathering', 'polaroid'].includes(mode);
-
-        // 拍立得效果：根据子选项生成各种变异边框
-        if (mode === 'polaroid') {
-            const frameCanvas = document.createElement('canvas');
-            const fCtx = frameCanvas.getContext('2d');
-            const padding = canvas.width * 0.08;
-            const bottomSpace = canvas.width * 0.28;
-
-            frameCanvas.width = canvas.width + padding * 2;
-            frameCanvas.height = canvas.height + padding + bottomSpace;
-            const fw = frameCanvas.width;
-            const fh = frameCanvas.height;
-
-            const effect = polaroidEffect;
-
-            // 1. 基础背景绘制
-            // 1. 基础背景绘制 (经典自尊白)
-            fCtx.fillStyle = '#fdfdfd';
-            fCtx.fillRect(0, 0, fw, fh);
-
-            // 风格特定背景/边框装饰
-            if (effect === 'vintage') {
-                // 复古：微微泛黄的旧纸感
-                fCtx.fillStyle = 'rgba(255, 200, 50, 0.05)';
-                fCtx.fillRect(0, 0, fw, fh);
-                // 模拟漏光效果
-                const grd = fCtx.createLinearGradient(0, 0, fw, 0);
-                grd.addColorStop(0, 'rgba(255, 50, 0, 0)');
-                grd.addColorStop(0.5, 'rgba(255, 50, 0, 0.1)');
-                grd.addColorStop(1, 'rgba(255, 50, 0, 0)');
-                fCtx.fillStyle = grd;
-                fCtx.fillRect(0, 0, fw, fh);
-            } else if (effect === 'fresh') {
-                // 清新：极致洁白，带一点点光泽
-                fCtx.fillStyle = 'rgba(255, 255, 255, 0.5)';
-                fCtx.shadowBlur = 20;
-                fCtx.shadowColor = 'rgba(255, 255, 255, 0.5)';
-                fCtx.strokeRect(padding / 2, padding / 2, fw - padding, fh - padding);
-                fCtx.shadowBlur = 0;
-            } else if (effect === 'dreamy') {
-                // 梦幻：柔和蓝边框
-                fCtx.fillStyle = 'rgba(0, 150, 255, 0.03)';
-                fCtx.fillRect(0, 0, fw, fh);
-            } else if (effect === 'warm') {
-                // 温馨：由于像素处理已偏暖，此处加一个淡淡的橙色晕染
-                fCtx.fillStyle = 'rgba(255, 100, 0, 0.02)';
-                fCtx.fillRect(0, 0, fw, fh);
-            }
-
-            // 2. 绘制相片主体
-            fCtx.drawImage(canvas, padding, padding);
-
-            // 3. 细节装饰：颗粒与物理真实感
-            fCtx.globalAlpha = 0.03;
-            fCtx.fillStyle = '#000';
-            for (let i = 0; i < fw; i += 5) fCtx.fillRect(i, 0, 1, fh); // 细微扫描线
-            fCtx.globalAlpha = 1.0;
-
-            // 给照片本体加一个非常细的灰色描边，模拟纸张边缘
-            fCtx.strokeStyle = 'rgba(0,0,0,0.1)';
-            fCtx.lineWidth = 1;
-            fCtx.strokeRect(padding, padding, canvas.width, canvas.height);
-
-            // 3. 全局纹理覆盖 (所有变异增加一张颗粒感网格)
-            fCtx.globalAlpha = 0.05;
-            fCtx.fillStyle = '#000';
-            for (let i = 0; i < fw; i += 4) fCtx.fillRect(i, 0, 1, fh);
-            fCtx.globalAlpha = 1.0;
-
-            finalDataUrl = frameCanvas.toDataURL('image/jpeg', 0.85);
-        } else {
-            finalDataUrl = canvas.toDataURL('image/jpeg', 0.90);
-        }
-
-        setCapturedImage(finalDataUrl);
+        }, 30); // 略微增加延迟以确保 Loading UI 先渲染出来
     };
 
     // 保存
+    // 保存 (仅保存到 App 相册，不自动下载)
+    // 保存 (保存到 App 内部文件系统)
     const savePhoto = async () => {
         if (!capturedImage) return;
         playSound('1.mp3');
 
-        // 1. 保存到应用内部相册 (localStorage)
-        const newPhotos = [capturedImage, ...photos].slice(0, 40);
-        setPhotos(newPhotos);
-        localStorage.setItem('captured_photos', JSON.stringify(newPhotos));
+        try {
+            // 生成文件名
+            const fileName = `cyber_${Date.now()}.jpg`;
 
-        // 2. 原生保存逻辑 (Capacitor)
+            // 写入 App Data 目录 (无限容量)
+            await Filesystem.writeFile({
+                path: fileName,
+                data: capturedImage.split(',')[1], // 去掉 prefix
+                directory: Directory.Data
+            });
+
+            // 更新状态 (只存文件名)
+            const newPhotos = [fileName, ...photos]; // 不再限制 slice(0, 40)
+            setPhotos(newPhotos);
+            localStorage.setItem('captured_photos', JSON.stringify(newPhotos));
+
+            showToast('已保存到相册', 'success');
+        } catch (storageErr) {
+            console.error("Save to filesystem failed:", storageErr);
+            showToast('存储失败: ' + storageErr.message, 'error');
+        }
+
+        // 退出预览页
+        setCapturedImage(null);
+    };
+
+    // 手动下载照片 (保存到设备)
+    // 手动下载照片 (保存到设备公共目录)
+    const downloadPhoto = async (photoId) => {
+        if (!photoId) return;
+        playSound('1.mp3');
+
+        // 1. 获取源文件内容 (Base64) - 兼容新旧数据
+        let base64Data = '';
+        if (photoId.startsWith('data:')) {
+            base64Data = photoId.split(',')[1];
+        } else {
+            // 从 Data 目录读取物理文件
+            try {
+                const file = await Filesystem.readFile({
+                    path: photoId,
+                    directory: Directory.Data,
+                    encoding: Encoding.UTF8
+                });
+                const raw = file.data;
+                // 智能兼容：分离 Body 和 Full URL
+                if (raw.startsWith('data:')) {
+                    base64Data = raw.split(',')[1];
+                } else {
+                    base64Data = raw;
+                }
+            } catch (e) {
+                console.error("Read file failed:", e);
+                showToast('无法读取原图', 'error');
+                return;
+            }
+        }
+
+        const dataUrl = `data:image/jpeg;base64,${base64Data}`;
+
         if (Capacitor.isNativePlatform()) {
             try {
                 const fileName = `CyberPhoto_${Date.now()}.jpg`;
-                // 写入物理文件 (这是判定成功的核心标准)
                 await Filesystem.writeFile({
                     path: fileName,
-                    data: capturedImage.split(',')[1],
+                    data: base64Data, // 直接写入 Base64 string
                     directory: Directory.Documents,
                 });
-
-                // 一旦写入成功，立即显示成功反馈
-                showToast('✨ 已成功保存到系统文档！', 'success');
-                setCapturedImage(null); // 提前清除预览，提升响应感
-
-                // 异步唤起分享，不再等待其结果，也不再捕获其取消异常
+                showToast('✨ 已保存到系统文档！', 'success');
                 Share.share({
                     title: '保存我的赛博瞬间',
-                    url: capturedImage,
+                    url: dataUrl,
                     dialogTitle: '保存到相册或分享',
                 }).catch(e => console.debug("Share closed or failed:", e));
-
             } catch (err) {
                 console.error("Save failed:", err);
                 showToast('保存失败，请检查存储权限', 'error');
             }
         } else {
-            // Web 预览模式降级逻辑
-            const link = document.createElement('a');
-            link.href = capturedImage;
-            link.download = `cyber-photo-${Date.now()}.jpg`;
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
+            try {
+                const link = document.createElement('a');
+                link.href = dataUrl;
+                link.download = `cyber-photo-${Date.now()}.jpg`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                showToast('✨ 已下载照片', 'success');
+            } catch (e) {
+                console.error("Web download failed", e);
+            }
         }
+    };
+    /* Legacy download function removed */
+    const _legacy_downloadPhoto_signature = async (imgUrl) => {
+        if (!imgUrl) return;
+        playSound('1.mp3');
 
-        setCapturedImage(null);
+        if (Capacitor.isNativePlatform()) {
+            try {
+                const fileName = `CyberPhoto_${Date.now()}.jpg`;
+                await Filesystem.writeFile({
+                    path: fileName,
+                    data: imgUrl.split(',')[1],
+                    directory: Directory.Documents,
+                });
+                showToast('✨ 已保存到系统文档！', 'success');
+                Share.share({
+                    title: '保存我的赛博瞬间',
+                    url: imgUrl,
+                    dialogTitle: '保存到相册或分享',
+                }).catch(e => console.debug("Share closed or failed:", e));
+            } catch (err) {
+                console.error("Save failed:", err);
+                showToast('保存失败，请检查存储权限', 'error');
+            }
+        } else {
+            try {
+                const link = document.createElement('a');
+                link.href = imgUrl;
+                link.download = `cyber-photo-${Date.now()}.jpg`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                showToast('✨ 已下载照片', 'success');
+            } catch (e) {
+                console.error("Web download failed", e);
+            }
+        }
     };
 
     // 删除照片
@@ -666,14 +1224,42 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
         setConfirmDialog({
             title: '删除照片',
             message: '这张珍贵的赛博瞬间将永久消失，确定吗？',
-            onConfirm: () => {
+            onConfirm: async () => {
                 playSound('1.mp3');
-                const newPhotos = photos.filter((_, i) => i !== index);
-                setPhotos(newPhotos);
-                localStorage.setItem('captured_photos', JSON.stringify(newPhotos));
-                if (viewingPhotoIndex === index) setViewingPhotoIndex(null);
-                setConfirmDialog(null);
-                showToast('照片已移出相册', 'info');
+                try {
+                    const photoToDelete = photos[index];
+
+                    // 1. 如果是文件，删除物理文件
+                    if (!photoToDelete.startsWith('data:')) {
+                        try {
+                            await Filesystem.deleteFile({
+                                path: photoToDelete,
+                                directory: Directory.Data
+                            });
+                        } catch (fsErr) {
+                            console.warn("File delete failed (maybe missing):", fsErr);
+                        }
+                    }
+
+                    // 2. 更新列表
+                    let nextIndex = null;
+                    if (photos.length > 1) {
+                        nextIndex = (index === photos.length - 1) ? index - 1 : index;
+                    }
+
+                    const newPhotos = photos.filter((_, i) => i !== index);
+                    setPhotos(newPhotos);
+                    setViewingPhotoIndex(nextIndex);
+
+                    // 3. 持久化列表
+                    localStorage.setItem('captured_photos', JSON.stringify(newPhotos));
+                    showToast('照片已移出相册', 'info');
+                } catch (e) {
+                    console.error("Delete failed:", e);
+                    showToast('移除失败：' + e.message, 'error');
+                } finally {
+                    setConfirmDialog(null);
+                }
             }
         });
     };
@@ -693,11 +1279,9 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
             </button>
 
             {/* --- 闪光 --- */}
-            <AnimatePresence>
-                {isShutterActive && (
-                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-white z-[100] pointer-events-none" />
-                )}
-            </AnimatePresence>
+            {/* --- 闪光 (已移除) --- */}
+            {/* <AnimatePresence> ... </AnimatePresence> */}
+
 
             {/* --- 取景器 Main View (支持手势变焦) --- */}
             <div
@@ -817,9 +1401,14 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
                     <motion.button
                         whileTap={{ scale: 0.9 }}
                         onClick={takePhoto}
-                        className="w-20 h-20 rounded-full border-4 border-white flex items-center justify-center bg-white/20 backdrop-blur-sm"
+                        disabled={isProcessing}
+                        className={`w-20 h-20 rounded-full border-4 flex items-center justify-center backdrop-blur-sm transition-all ${isProcessing ? 'border-zinc-500 bg-zinc-800 scale-95' : 'border-white bg-white/20'}`}
                     >
-                        <div className={`w-16 h-16 rounded-full ${mode === 'normal' ? 'bg-white' : 'bg-red-500'} transition-colors duration-300`} />
+                        {isProcessing ? (
+                            <RefreshCw className="animate-spin text-white/50" size={32} />
+                        ) : (
+                            <div className={`w-16 h-16 rounded-full ${mode === 'normal' ? 'bg-white' : 'bg-red-500'} transition-colors duration-300`} />
+                        )}
                     </motion.button>
 
                     {/* 右侧：相册入口 (缩略图) */}
@@ -828,9 +1417,9 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
                         className="w-12 h-12 rounded-full border-2 border-white/30 overflow-hidden bg-zinc-800 active:scale-95 transition-all"
                     >
                         {photos.length > 0 ? (
-                            <img src={photos[0]} className="w-full h-full object-cover" alt="最新" />
+                            <LazyImg id={photos[0]} className="w-full h-full object-cover opacity-80" alt="最新" eager={true} />
                         ) : (
-                            <div className="w-full h-full flex items-center justify-center aspect-square"><ImageIcon size={20} className="text-white/30" /></div>
+                            <div className="w-full h-full flex items-center justify-center text-white/50"><ImageIcon size={20} /></div>
                         )}
                     </button>
                 </div>
@@ -845,13 +1434,21 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
                             <h2 className="font-black text-lg tracking-widest text-white">所有照片</h2>
                             <div className="w-20" />
                         </div>
-                        <div className="flex-1 overflow-y-auto p-4 grid grid-cols-3 gap-1">
+                        <div style={{ height: '100%' }} className="flex-1 overflow-y-auto p-4">
                             {photos.length === 0 && <div className="col-span-3 text-center text-white/20 mt-20">暂无照片</div>}
-                            {photos.map((url, index) => (
-                                <div key={index} onClick={() => setViewingPhotoIndex(index)} className="aspect-square bg-zinc-800 overflow-hidden relative">
-                                    <img src={url} className="w-full h-full object-cover" loading="lazy" />
-                                </div>
-                            ))}
+                            {photos.length > 0 && (
+                                <VirtualizedGrid
+                                    items={photos}
+                                    columnCount={3}
+                                    gapPx={4}
+                                    overscan={3}
+                                    renderCell={(item, index) => (
+                                        <div key={index} onClick={() => setViewingPhotoIndex(index)} className="relative rounded-sm overflow-hidden">
+                                            <LazyImg id={item} className="w-full h-full object-cover" alt={`照片 ${index}`} />
+                                        </div>
+                                    )}
+                                />
+                            )}
                         </div>
                     </motion.div>
                 )}
@@ -890,7 +1487,9 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
                             }}
                             className="absolute inset-0 flex flex-col items-center justify-center p-0 touch-none"
                         >
-                            <img src={photos[viewingPhotoIndex]} className="w-full flex-1 object-contain pointer-events-none" />
+                            {photos[viewingPhotoIndex] && (
+                                <LazyImg id={photos[viewingPhotoIndex]} className="w-full flex-1 object-contain pointer-events-none" alt="大图" eager={true} />
+                            )}
 
                             <div className="absolute top-10 left-4">
                                 <button onClick={() => { setViewingDirection(0); setViewingPhotoIndex(null); }} className="p-3 bg-white/20 backdrop-blur-md rounded-full text-white active:scale-90 transition-all border border-white/10"><ArrowLeft size={24} /></button>
@@ -904,6 +1503,9 @@ const RetroCamera = ({ onClose, onSetWallpaper }) => {
                             <div className="absolute bottom-12 left-0 right-0 flex justify-center gap-12">
                                 <button onClick={() => { onSetWallpaper(photos[viewingPhotoIndex]); showToast('✨ 壁纸设置成功！', 'success'); }} className="flex flex-col items-center gap-1 text-white/80 active:scale-90 transition-all">
                                     <Monitor size={24} /> <span className="text-[10px]">设为壁纸</span>
+                                </button>
+                                <button onClick={() => downloadPhoto(photos[viewingPhotoIndex])} className="flex flex-col items-center gap-1 text-white/80 active:scale-90 transition-all">
+                                    <Download size={24} /> <span className="text-[10px]">下载保存</span>
                                 </button>
                                 <button onClick={() => deletePhoto(viewingPhotoIndex)} className="flex flex-col items-center gap-1 text-red-500 active:scale-90 transition-all">
                                     <Trash2 size={24} /> <span className="text-[10px]">删除照片</span>

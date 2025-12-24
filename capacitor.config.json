@@ -1,5 +1,8 @@
 {
   "appId": "com.example.androidtoyapp",
   "appName": "AndroidToyApp",
-  "webDir": "dist"
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  }
 }
